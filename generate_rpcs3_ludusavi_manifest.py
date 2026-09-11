@@ -161,8 +161,10 @@ def manifest_for_games(
             files[path] = {"tags": ["save"]}
         else:
             files[f"<root>/dev_hdd0/home/*/savedata/{game.serial}*"] = {
-                "when": [{"os": "linux"}],
                 "tags": ["save"],
+            }
+            files[f"<root>/custom_configs/config_{game.serial}.yml"] = {
+                "tags": ["config"],
             }
         manifest[key] = {
             "files": files,
