@@ -2,14 +2,29 @@
 """
 Generate a Ludusavi manifest for PS3 games emulated with RPCS3.
 
-The script downloads the published PS3 serial/game list, maps PS3 title IDs
-(e.g. BCUS98123) to game names, and writes a Ludusavi-compatible YAML
-manifest whose RPCS3 save paths use the title-ID prefix:
+This version groups PS3 Title IDs by the actual game relationships maintained
+by SerialStation instead of treating every Title ID as a separate Ludusavi
+game entry.
 
-    .../dev_hdd0/home/*/savedata/BCUS98123*
+Example result:
 
-This deliberately matches all savedata directories beginning with the serial,
-so game-specific suffixes such as _0, _1, _P, or other names are included.
+    Uncharted 2: Among Thieves:
+      files:
+        <xdgConfig>/rpcs3/dev_hdd0/home/*/savedata/BCAS20097*:
+          when: [{os: linux}]
+          tags: [save]
+        <xdgConfig>/rpcs3/dev_hdd0/home/*/savedata/BCUS98123*:
+          when: [{os: linux}]
+          tags: [save]
+        ...
+
+This means Ludusavi shows one game, while its `files` mapping covers every
+known PS3 Title ID for that game. Each Title ID path ends in `*`, because RPCS3
+save directory suffixes are game-defined (for example `_0`, `_1`, `_P`).
+
+Data sources:
+- SerialStation API: authoritative game <-> PS3 Title ID relationships.
+- The original PS3 serial catalog is optionally merged as a coverage fallback.
 
 Dependencies:
     pip install requests beautifulsoup4 pyyaml jsonschema
@@ -19,25 +34,26 @@ Examples:
     python generate_rpcs3_ludusavi_manifest.py --rpcs3-root /path/to/rpcs3
     python generate_rpcs3_ludusavi_manifest.py --only-existing-saves \
         --rpcs3-root /path/to/rpcs3
+    python generate_rpcs3_ludusavi_manifest.py --no-catalog-fallback
 
 Notes:
-- The manifest contains entries for every PS3 serial discovered in the
-  published catalog by default. This is intentional: Ludusavi evaluates the
-  paths as globs when scanning and will only find entries that exist locally.
-- Standard RPCS3 configuration roots are represented with Ludusavi's built-in
-  OS placeholders. A portable/custom RPCS3 directory cannot be represented by
-  a portable custom placeholder in a generic manifest, so the standard OS
-  locations are used unless --portable-root is requested.
+- SerialStation's new API is explicitly marked as not final, so the script
+  validates its response shape and can cache the downloaded JSON.
+- Demos are excluded by default (`content_type == Game` only). Use
+  --include-demos if you want demo save data included.
+- The manifest uses Ludusavi's standard OS placeholders. A portable/custom
+  RPCS3 installation can be generated with --portable-root.
 """
 
 from __future__ import annotations
 
 import argparse
 import html
+import json
 import re
 import sys
-from collections import OrderedDict
-from dataclasses import dataclass
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
@@ -47,67 +63,95 @@ from bs4 import BeautifulSoup
 from jsonschema import Draft202012Validator
 
 CATALOG_URL = "https://bishalqx980.github.io/playstation/ps3/gameslist.html"
+SERIALSTATION_API = "https://api.serialstation.com/v1"
 SCHEMA_URL = "https://raw.githubusercontent.com/mtkennerly/ludusavi-manifest/master/data/schema.yaml"
 RPCS3_SAVE_SOURCE_URL = "https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellSaveData.cpp"
 LUDUSAVI_README_URL = "https://github.com/mtkennerly/ludusavi-manifest/blob/master/README.md"
+SERIALSTATION_API_DOCS_URL = "https://api.serialstation.com/v1/docs"
 
-# The published list uses serials such as BCUS98123, BLES00932, BCES00065, etc.
-# Keep the pattern strict enough to avoid accidental matches in prose.
 SERIAL_RE = re.compile(r"\b([A-Z]{4}\d{5})\b")
 LINE_RE = re.compile(r"^\s*([A-Z]{4}\d{5})\s*=\s*(.*?)\s*$")
-
-USER_AGENT = "rpcs3-ludusavi-manifest-generator/1.0"
+USER_AGENT = "rpcs3-ludusavi-manifest-generator/2.0"
 
 
 @dataclass(frozen=True)
-class Game:
+class CatalogEntry:
     serial: str
     title: str
 
 
-def fetch_catalog(url: str, timeout: float) -> str:
-    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-    response = requests.get(url, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    response.encoding = response.encoding or "utf-8"
-    return response.text
+@dataclass
+class GameGroup:
+    """One logical game as represented by SerialStation or a catalog fallback."""
+
+    key: str
+    title: str
+    serials: set[str] = field(default_factory=set)
+    serialstation_id: str | None = None
+    source: str = "serialstation"
 
 
 def normalize_title(value: str) -> str:
     value = html.unescape(value)
     value = re.sub(r"\s+", " ", value).strip()
-    # Avoid YAML surprises from an empty title while preserving the original
-    # catalog wording as much as practical.
     return value or "Unknown PS3 game"
 
 
-def parse_catalog(raw_html: str) -> list[Game]:
-    """Parse the catalog robustly, handling both the current text-like page and tables."""
-    games: "OrderedDict[str, Game]" = OrderedDict()
+def title_key(value: str) -> str:
+    """Normalize titles for conservative exact-name fallback matching."""
+    value = normalize_title(value).casefold()
+    value = re.sub(r"[™®©]", "", value)
+    value = re.sub(r"[’'`\"]", "", value)
+    value = re.sub(r"[^\w]+", " ", value, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", value).strip()
 
+
+def fetch_json(session: requests.Session, url: str, params: dict, timeout: float) -> dict:
+    response = session.get(
+        url,
+        params=params,
+        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected JSON object from {response.url}")
+    return data
+
+
+def fetch_catalog(session: requests.Session, url: str, timeout: float) -> str:
+    response = session.get(
+        url,
+        headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    response.encoding = response.encoding or "utf-8"
+    return response.text
+
+
+def parse_catalog(raw_html: str) -> list[CatalogEntry]:
+    """Parse the published serial = title list, tolerating minor HTML changes."""
+    entries: "OrderedDict[str, CatalogEntry]" = OrderedDict()
     soup = BeautifulSoup(raw_html, "html.parser")
 
-    # First pass: table/list rows, preserving their text.
     text = soup.get_text("\n", strip=False)
     for raw_line in text.splitlines():
         line = normalize_title(raw_line)
         match = LINE_RE.match(line)
         if match:
             serial, title = match.groups()
-            games.setdefault(serial, Game(serial=serial, title=normalize_title(title)))
+            entries.setdefault(serial, CatalogEntry(serial, normalize_title(title)))
 
-    # Second pass: some versions of the page may put entries inside HTML
-    # elements without a clean one-entry-per-line text representation.
     for element in soup.find_all(["li", "td", "div", "p", "option", "a"]):
         line = normalize_title(element.get_text(" ", strip=True))
         match = LINE_RE.match(line)
         if match:
             serial, title = match.groups()
-            games.setdefault(serial, Game(serial=serial, title=normalize_title(title)))
+            entries.setdefault(serial, CatalogEntry(serial, normalize_title(title)))
 
-    # Third pass: fallback over raw textual source. This handles minor markup
-    # changes such as <br> without making the parser dependent on one DOM shape.
-    if not games:
+    if not entries:
         flattened = re.sub(r"<br\s*/?>", "\n", raw_html, flags=re.I)
         flattened = re.sub(r"</(?:p|div|li|tr)>", "\n", flattened, flags=re.I)
         flattened = BeautifulSoup(flattened, "html.parser").get_text("\n")
@@ -116,28 +160,229 @@ def parse_catalog(raw_html: str) -> list[Game]:
             match = LINE_RE.match(line)
             if match:
                 serial, title = match.groups()
-                games.setdefault(serial, Game(serial=serial, title=normalize_title(title)))
+                entries.setdefault(serial, CatalogEntry(serial, normalize_title(title)))
 
-    # Final fallback: find serial/title pairs in the raw text. We only use a
-    # restricted context after '=' so random serial mentions are not promoted.
-    if not games:
-        visible = normalize_title(soup.get_text(" ", strip=True))
-        for match in re.finditer(r"\b([A-Z]{4}\d{5})\s*=\s*([^=]{1,300}?)(?=\b[A-Z]{4}\d{5}\s*=|$)", visible):
+    if not entries:
+        visible = soup.get_text(" ", strip=True)
+        for match in re.finditer(
+            r"\b([A-Z]{4}\d{5})\s*=\s*([^=]{1,300}?)(?=\b[A-Z]{4}\d{5}\s*=|$)",
+            visible,
+        ):
             serial = match.group(1)
             title = normalize_title(match.group(2))
-            games.setdefault(serial, Game(serial=serial, title=title))
+            entries.setdefault(serial, CatalogEntry(serial, title))
 
-    return list(games.values())
+    return list(entries.values())
 
 
-def yaml_quote_key(value: str) -> str:
-    # We emit quoted keys consistently because game names can contain ':', '#',
-    # quotes, apostrophes, brackets, etc.
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+def parse_serialstation_title_ids(data: dict, *, include_demos: bool) -> list[dict]:
+    items = data.get("items")
+    count = data.get("count")
+    if not isinstance(items, list) or not isinstance(count, int):
+        raise ValueError("SerialStation /title-ids response does not have the expected items/count shape")
+
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        title_id = item.get("title_id")
+        content_type = str(item.get("content_type", "")).strip().casefold()
+        systems = item.get("systems")
+        games = item.get("games")
+        if not isinstance(title_id, str) or not SERIAL_RE.fullmatch(title_id):
+            continue
+        if not isinstance(systems, list) or not any(str(s).casefold() in {"playstation 3", "ps3"} for s in systems):
+            continue
+        if not include_demos and content_type != "game":
+            continue
+        if not isinstance(games, list):
+            games = []
+        result.append(
+            {
+                "title_id": title_id.upper(),
+                "name": normalize_title(str(item.get("name") or "Unknown PS3 game")),
+                "content_type": content_type,
+                "games": games,
+            }
+        )
+    return result
+
+
+def fetch_serialstation_title_ids(
+    session: requests.Session,
+    *,
+    timeout: float,
+    cache_path: Path | None,
+    include_demos: bool,
+) -> list[dict]:
+    if cache_path and cache_path.is_file():
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+        if not isinstance(cached, dict):
+            raise ValueError(f"SerialStation cache {cache_path} is not a JSON object")
+        print(f"Using cached SerialStation data: {cache_path}")
+        return parse_serialstation_title_ids(cached, include_demos=include_demos)
+
+    all_items: list[dict] = []
+    offset = 0
+    limit = 100
+    total: int | None = None
+
+    print("Downloading PS3 Title ID relationships from SerialStation API...")
+    while True:
+        data = fetch_json(
+            session,
+            f"{SERIALSTATION_API}/title-ids/",
+            {"system": "PS3", "limit": limit, "offset": offset},
+            timeout,
+        )
+        items = data.get("items")
+        count = data.get("count")
+        if not isinstance(items, list) or not isinstance(count, int):
+            raise ValueError("SerialStation /title-ids response does not have the expected items/count shape")
+        if total is None:
+            total = count
+            print(f"SerialStation reports {total} PS3 Title IDs")
+        all_items.extend(items)
+        offset += len(items)
+        if not items or offset >= count:
+            break
+        if len(items) < limit:
+            break
+        print(f"  fetched {offset}/{count} Title IDs")
+
+    combined = {"items": all_items, "count": len(all_items)}
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(combined, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"Wrote SerialStation cache: {cache_path}")
+
+    return parse_serialstation_title_ids(combined, include_demos=include_demos)
+
+
+def group_serialstation_games(title_ids: Iterable[dict]) -> tuple[list[GameGroup], dict[str, str]]:
+    """Group Title IDs by SerialStation game UUID.
+
+    Returns groups plus a title-id -> group-key map. A title ID can technically
+    be associated with more than one game in the API, so it is added to every
+    associated game rather than silently choosing one.
+    """
+    groups: "OrderedDict[str, GameGroup]" = OrderedDict()
+    serial_to_group: dict[str, str] = {}
+
+    for item in title_ids:
+        serial = item["title_id"]
+        api_games = item.get("games") or []
+        valid_games = [g for g in api_games if isinstance(g, dict) and g.get("id") and g.get("name")]
+
+        if not valid_games:
+            # We cannot safely invent a UUID. Keep the Title ID available to a
+            # later catalog fallback instead.
+            continue
+
+        for api_game in valid_games:
+            game_id = str(api_game["id"])
+            title = normalize_title(str(api_game["name"]))
+            group = groups.get(game_id)
+            if group is None:
+                group = GameGroup(key=game_id, title=title, serialstation_id=game_id)
+                groups[game_id] = group
+            group.serials.add(serial)
+            serial_to_group[serial] = game_id
+
+    return list(groups.values()), serial_to_group
+
+
+def merge_catalog_fallback(
+    groups: list[GameGroup],
+    catalog: Iterable[CatalogEntry],
+    serial_to_group: dict[str, str],
+) -> tuple[list[GameGroup], list[str], list[str]]:
+    """Merge catalog-only IDs conservatively.
+
+    Known SerialStation IDs are always retained. Catalog-only IDs are first
+    attached to a SerialStation group with the same normalized title. If no
+    exact title match exists, a new fallback group is created. This prevents
+    fuzzy matching from accidentally merging unrelated games.
+    """
+    by_key = {g.key: g for g in groups}
+    by_title: dict[str, list[GameGroup]] = defaultdict(list)
+    for group in groups:
+        by_title[title_key(group.title)].append(group)
+
+    added_to_existing: list[str] = []
+    fallback_groups: list[str] = []
+
+    for entry in catalog:
+        serial = entry.serial.upper()
+        if serial in serial_to_group:
+            continue
+
+        candidates = by_title.get(title_key(entry.title), [])
+        if len(candidates) == 1:
+            candidates[0].serials.add(serial)
+            serial_to_group[serial] = candidates[0].key
+            added_to_existing.append(serial)
+            continue
+
+        # If there are multiple SerialStation games with the same title, do
+        # not guess which one owns the catalog-only ID.
+        key = f"catalog:{serial}"
+        group = GameGroup(
+            key=key,
+            title=entry.title,
+            serials={serial},
+            source="catalog-fallback",
+        )
+        by_key[key] = group
+        groups.append(group)
+        serial_to_group[serial] = key
+        fallback_groups.append(serial)
+
+    return groups, added_to_existing, fallback_groups
+
+
+def discover_local_saves(rpcs3_root: Path) -> dict[str, list[Path]]:
+    """Return RPCS3 save directories grouped by Title ID prefix."""
+    savedata_root = rpcs3_root / "dev_hdd0" / "home"
+    found: dict[str, list[Path]] = defaultdict(list)
+    if not savedata_root.is_dir():
+        return dict(found)
+
+    for user_dir in sorted(savedata_root.iterdir()):
+        save_root = user_dir / "savedata"
+        if not save_root.is_dir():
+            continue
+        for entry in sorted(save_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            match = SERIAL_RE.match(entry.name.upper())
+            if match:
+                found[match.group(1)].append(entry)
+    return dict(found)
+
+
+def filter_groups_to_local(groups: list[GameGroup], local: dict[str, list[Path]]) -> list[GameGroup]:
+    local_serials = set(local)
+    result = []
+    for group in groups:
+        matched = group.serials & local_serials
+        if matched:
+            # Do not emit paths for known Title IDs that do not exist locally
+            # when --only-existing-saves is requested.
+            result.append(
+                GameGroup(
+                    key=group.key,
+                    title=group.title,
+                    serials=matched,
+                    serialstation_id=group.serialstation_id,
+                    source=group.source,
+                )
+            )
+    return result
 
 
 def manifest_for_games(
-    games: Iterable[Game],
+    groups: Iterable[GameGroup],
     *,
     include_linux: bool,
     include_windows: bool,
@@ -145,34 +390,46 @@ def manifest_for_games(
     portable_root: str | None,
 ) -> OrderedDict:
     manifest: OrderedDict[str, dict] = OrderedDict()
+    used_names: set[str] = set()
 
-    for game in games:
-        # Put the serial in the manifest title. This keeps different regional
-        # releases/editions from colliding when the catalog uses the same name.
-        key = f"{game.title} [{game.serial}]"
+    for group in sorted(groups, key=lambda g: (g.title.casefold(), g.key)):
+        name = group.title
+        if name in used_names:
+            # Same display name but distinct SerialStation games: retain both
+            # rather than silently overwriting a YAML mapping key.
+            if group.serialstation_id:
+                name = f"{name} [{group.serialstation_id}]"
+            else:
+                name = f"{name} [catalog fallback]"
+        used_names.add(name)
 
         files: OrderedDict[str, dict] = OrderedDict()
+        for serial in sorted(group.serials):
+            if portable_root:
+                path = str(
+                    Path(portable_root).expanduser()
+                    / "dev_hdd0"
+                    / "home"
+                    / "*"
+                    / "savedata"
+                    / f"{serial}*"
+                )
+                files[path] = {"tags": ["save"]}
+            else:
+                files[f"<root>/dev_hdd0/home/*/savedata/{serial}*"] = {
+                    "tags": ["save"],
+                }
+                files[f"<root>/custom_configs/config_{serial}.yml"] = {
+                    "tags": ["config"],
+                }
 
-        if portable_root:
-            # A user-supplied portable path is inherently machine-specific.
-            # Use it as an unrestricted path, since the user explicitly asked
-            # for a single RPCS3 installation rather than standard locations.
-            path = str(Path(portable_root).expanduser() / "dev_hdd0" / "home" / "*" / "savedata" / f"{game.serial}*")
-            files[path] = {"tags": ["save"]}
-        else:
-            files[f"<root>/dev_hdd0/home/*/savedata/{game.serial}*"] = {
-                "tags": ["save"],
-            }
-            files[f"<root>/custom_configs/config_{game.serial}.yml"] = {
-                "tags": ["config"],
-            }
-        manifest[key] = {
+        manifest[name] = {
             "files": files,
             "notes": [
                 {
                     "message": (
-                        f"RPCS3 PS3 savedata matched by title ID prefix {game.serial}. "
-                        "The trailing directory name is game-defined; the wildcard intentionally covers all matching save directories."
+                        f"RPCS3 PS3 savedata for {len(group.serials)} known Title ID(s). "
+                        "Each Title ID uses a trailing wildcard because the save directory suffix is game-defined."
                     )
                 }
             ],
@@ -182,18 +439,16 @@ def manifest_for_games(
 
 
 def dump_yaml(manifest: OrderedDict, output: Path) -> None:
-    class LiteralDumper(yaml.SafeDumper):
+    class Dumper(yaml.SafeDumper):
         pass
 
-    # Preserve insertion order (important for deterministic output).
     def represent_ordered_dict(dumper, data):
         return dumper.represent_dict(data.items())
 
-    LiteralDumper.add_representer(OrderedDict, represent_ordered_dict)
-
+    Dumper.add_representer(OrderedDict, represent_ordered_dict)
     rendered = yaml.dump(
         manifest,
-        Dumper=LiteralDumper,
+        Dumper=Dumper,
         allow_unicode=True,
         sort_keys=False,
         default_flow_style=False,
@@ -208,14 +463,9 @@ def validate_yaml(path: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError("Generated YAML root must be a mapping/object")
 
-    # Structural checks mirroring the parts of Ludusavi's generic schema that
-    # matter for this generator. The official schema intentionally permits
-    # arbitrary OS/store strings, so we do not over-constrain those fields.
     for game_name, entry in data.items():
-        if not isinstance(game_name, str):
-            raise ValueError("Every game key must be a string")
-        if not isinstance(entry, dict):
-            raise ValueError(f"Entry {game_name!r} is not a mapping")
+        if not isinstance(game_name, str) or not isinstance(entry, dict):
+            raise ValueError(f"Invalid game entry {game_name!r}")
         files = entry.get("files")
         if not isinstance(files, dict) or not files:
             raise ValueError(f"Entry {game_name!r} must contain a non-empty files mapping")
@@ -226,24 +476,12 @@ def validate_yaml(path: Path) -> dict:
                 raise ValueError(f"File rule {path!r} in {game_name!r} is not a mapping")
             if "tags" in details and not isinstance(details["tags"], list):
                 raise ValueError(f"tags for {game_name!r}/{path!r} must be a list")
-            if "when" in details:
-                when = details["when"]
-                if not isinstance(when, list):
-                    raise ValueError(f"when for {game_name!r}/{path!r} must be a list")
-                for constraint in when:
-                    if not isinstance(constraint, dict):
-                        raise ValueError(f"invalid when constraint for {game_name!r}/{path!r}")
-
+            if "when" in details and not isinstance(details["when"], list):
+                raise ValueError(f"when for {game_name!r}/{path!r} must be a list")
     return data
 
 
-def validate_against_official_schema(
-    data: dict,
-    *,
-    schema_url: str,
-    timeout: float,
-) -> None:
-    """Validate the generated manifest against Ludusavi's current generic schema."""
+def validate_against_official_schema(data: dict, *, schema_url: str, timeout: float) -> None:
     response = requests.get(
         schema_url,
         headers={"User-Agent": USER_AGENT, "Accept": "text/plain,text/yaml,*/*"},
@@ -263,62 +501,73 @@ def validate_against_official_schema(
             details.append(f"{location}: {error.message}")
         suffix = "" if len(errors) <= 10 else f" (showing first 10 of {len(errors)})"
         raise ValueError(
-            "Generated manifest does not validate against Ludusavi schema" + suffix + ":\n  " + "\n  ".join(details)
+            "Generated manifest does not validate against Ludusavi schema"
+            + suffix
+            + ":\n  "
+            + "\n  ".join(details)
         )
 
 
+def print_summary(
+    groups: list[GameGroup],
+    catalog: list[CatalogEntry],
+    local: dict[str, list[Path]] | None,
+    *,
+    serialstation_title_ids: int,
+    catalog_fallback_count: int,
+    include_demos: bool,
+) -> None:
+    serial_count = sum(len(g.serials) for g in groups)
+    print(f"Logical game entries: {len(groups)}")
+    print(f"Known PS3 Title IDs represented: {serial_count}")
+    print(f"SerialStation Title IDs considered: {serialstation_title_ids}")
+    print(f"Original catalog entries: {len(catalog)}")
+    print(f"Catalog-only fallback Title IDs: {catalog_fallback_count}")
+    print(f"Demo Title IDs included: {'yes' if include_demos else 'no'}")
 
-def discover_local_saves(rpcs3_root: Path) -> dict[str, list[Path]]:
-    """Return save directories grouped by detected PS3 title ID prefix."""
-    savedata_root = rpcs3_root / "dev_hdd0" / "home"
-    found: dict[str, list[Path]] = {}
-    if not savedata_root.is_dir():
-        return found
-
-    for user_dir in sorted(savedata_root.iterdir()):
-        save_root = user_dir / "savedata"
-        if not save_root.is_dir():
-            continue
-        for entry in sorted(save_root.iterdir()):
-            if not entry.is_dir():
-                continue
-            match = SERIAL_RE.match(entry.name)
-            if match:
-                found.setdefault(match.group(1), []).append(entry)
-    return found
-
-
-def print_summary(games: list[Game], local: dict[str, list[Path]] | None) -> None:
-    print(f"Catalog entries: {len(games)}")
-    if local is None:
-        return
-
-    serials_with_saves = set(local)
-    matched = sum(1 for game in games if game.serial in serials_with_saves)
-    unmatched_local = sorted(serials_with_saves - {game.serial for game in games})
-    print(f"Local RPCS3 serials with save directories: {len(local)}")
-    print(f"Catalog serials represented locally: {matched}")
-
-    if local:
-        print("\nDetected local save directories:")
-        for serial in sorted(local):
-            for path in local[serial]:
-                print(f"  {serial}: {path}")
-    if unmatched_local:
-        print("\nLocal serials not found in catalog:")
-        for serial in unmatched_local:
-            print(f"  {serial}")
+    if local is not None:
+        local_serials = set(local)
+        known_serials = {s for g in groups for s in g.serials}
+        print(f"Local RPCS3 Title IDs with save directories: {len(local)}")
+        print(f"Local Title IDs represented by generated groups: {len(local_serials & known_serials)}")
+        unknown = sorted(local_serials - known_serials)
+        if unknown:
+            print("\nLocal Title IDs not represented in the generated manifest:")
+            for serial in unknown:
+                for path in local[serial]:
+                    print(f"  {serial}: {path}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("-o", "--output", type=Path, default=Path("rpcs3.yaml"), help="Output YAML file (default: rpcs3.yaml)")
-    parser.add_argument("--catalog-url", default=CATALOG_URL, help=f"PS3 catalog URL (default: {CATALOG_URL})")
-    parser.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout in seconds (default: 30)")
+    parser.add_argument("-o", "--output", type=Path, default=Path("rpcs3.yaml"))
+    parser.add_argument("--catalog-url", default=CATALOG_URL)
+    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument(
+        "--serialstation-cache",
+        type=Path,
+        help="Optional JSON cache for the SerialStation /title-ids/ response.",
+    )
+    parser.add_argument(
+        "--catalog-cache",
+        type=Path,
+        help="Optional HTML cache for the original PS3 serial catalog.",
+    )
+    parser.add_argument("--no-cache-write", action="store_true")
+    parser.add_argument(
+        "--no-catalog-fallback",
+        action="store_true",
+        help="Use only SerialStation game relationships; do not merge catalog-only Title IDs.",
+    )
+    parser.add_argument(
+        "--include-demos",
+        action="store_true",
+        help="Include SerialStation Title IDs whose content_type is Demo.",
+    )
     parser.add_argument(
         "--rpcs3-root",
         type=Path,
-        help="Optional RPCS3 root to inspect locally (the directory containing dev_hdd0).",
+        help="Optional RPCS3 root to inspect locally (directory containing dev_hdd0).",
     )
     parser.add_argument(
         "--portable-root",
@@ -328,18 +577,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--only-existing-saves",
         action="store_true",
-        help="Only generate manifest entries for serials that currently have a local RPCS3 save directory.",
+        help="Only emit Title IDs for save directories currently found under --rpcs3-root.",
     )
-    parser.add_argument("--no-linux", action="store_true", help="Do not emit Linux rules")
-    parser.add_argument("--no-windows", action="store_true", help="Do not emit Windows rules")
-    parser.add_argument("--no-mac", action="store_true", help="Do not emit macOS rules")
-    parser.add_argument(
-        "--catalog-cache",
-        type=Path,
-        help="Optional local HTML cache. If present it is used instead of downloading; otherwise it is written after download.",
-    )
-    parser.add_argument("--no-cache-write", action="store_true", help="Do not write a catalog cache")
-    parser.add_argument("--no-schema-validation", action="store_true", help="Skip validation against the current official Ludusavi schema")
+    parser.add_argument("--no-linux", action="store_true")
+    parser.add_argument("--no-windows", action="store_true")
+    parser.add_argument("--no-mac", action="store_true")
+    parser.add_argument("--no-schema-validation", action="store_true")
     return parser
 
 
@@ -347,77 +590,98 @@ def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
 
+    if args.only_existing_saves and not args.rpcs3_root:
+        parser.error("--only-existing-saves requires --rpcs3-root")
+    if not args.portable_root and args.no_linux and args.no_windows and args.no_mac:
+        parser.error("All OS rules are disabled")
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
     try:
-        # A portable root makes sense only as a local/machine-specific manifest.
-        if args.portable_root and args.only_existing_saves and not args.rpcs3_root:
-            parser.error("--only-existing-saves requires --rpcs3-root")
+        # 1. SerialStation: Title ID -> actual game UUID/name.
+        title_ids = fetch_serialstation_title_ids(
+            session,
+            timeout=args.timeout,
+            cache_path=args.serialstation_cache,
+            include_demos=args.include_demos,
+        )
+        groups, serial_to_group = group_serialstation_games(title_ids)
+        print(f"SerialStation logical games found: {len(groups)}")
 
-        raw_html: str
-        if args.catalog_cache and args.catalog_cache.is_file():
-            raw_html = args.catalog_cache.read_text(encoding="utf-8", errors="replace")
-            print(f"Using cached catalog: {args.catalog_cache}")
-        else:
-            print(f"Downloading PS3 catalog: {args.catalog_url}")
-            raw_html = fetch_catalog(args.catalog_url, args.timeout)
-            if args.catalog_cache and not args.no_cache_write:
-                args.catalog_cache.parent.mkdir(parents=True, exist_ok=True)
-                args.catalog_cache.write_text(raw_html, encoding="utf-8")
-                print(f"Wrote catalog cache: {args.catalog_cache}")
+        # 2. Original catalog: coverage fallback for IDs SerialStation does not
+        # know yet. This is deliberately conservative: exact title match only.
+        catalog: list[CatalogEntry] = []
+        catalog_fallback_count = 0
+        added_to_existing = 0
+        if not args.no_catalog_fallback:
+            if args.catalog_cache and args.catalog_cache.is_file():
+                raw_html = args.catalog_cache.read_text(encoding="utf-8", errors="replace")
+                print(f"Using cached PS3 catalog: {args.catalog_cache}")
+            else:
+                print(f"Downloading PS3 serial catalog: {args.catalog_url}")
+                raw_html = fetch_catalog(session, args.catalog_url, args.timeout)
+                if args.catalog_cache and not args.no_cache_write:
+                    args.catalog_cache.parent.mkdir(parents=True, exist_ok=True)
+                    args.catalog_cache.write_text(raw_html, encoding="utf-8")
+                    print(f"Wrote PS3 catalog cache: {args.catalog_cache}")
+            catalog = parse_catalog(raw_html)
+            if not catalog:
+                raise RuntimeError("No PS3 serials were parsed from the catalog")
+            groups, added, fallback = merge_catalog_fallback(groups, catalog, serial_to_group)
+            added_to_existing = len(added)
+            catalog_fallback_count = len(fallback)
+            print(f"Catalog-only IDs attached to an existing game by exact title: {added_to_existing}")
+            print(f"Catalog-only IDs requiring fallback game entries: {catalog_fallback_count}")
 
-        games = parse_catalog(raw_html)
-        if not games:
-            raise RuntimeError(
-                "No PS3 serials were parsed from the catalog. The site format may have changed; "
-                f"inspect {args.catalog_url} or provide --catalog-cache."
-            )
-
+        # 3. Optional local scan.
         local: dict[str, list[Path]] | None = None
         if args.rpcs3_root:
             local = discover_local_saves(args.rpcs3_root.expanduser().resolve())
+            print(f"Found {len(local)} local RPCS3 Title IDs with save directories")
+            if args.only_existing_saves:
+                groups = filter_groups_to_local(groups, local)
+                print(f"Filtered to {len(groups)} logical games with existing saves")
 
-        if args.only_existing_saves:
-            serials = set(local or {})
-            games = [game for game in games if game.serial in serials]
-            print(f"Filtered to {len(games)} catalog entries with existing local saves.")
-
-        if not games:
-            raise RuntimeError("No games remain after filtering.")
+        if not groups:
+            raise RuntimeError("No logical games remain after filtering")
 
         manifest = manifest_for_games(
-            games,
+            groups,
             include_linux=not args.no_linux,
             include_windows=not args.no_windows,
             include_mac=not args.no_mac,
             portable_root=args.portable_root,
         )
-
-        # Fail early rather than generating a useless file when every platform
-        # output has accidentally been disabled.
-        if not manifest:
-            raise RuntimeError("Manifest would be empty.")
-        if not args.portable_root and args.no_linux and args.no_windows and args.no_mac:
-            raise RuntimeError("All OS rules are disabled. Remove one of --no-linux/--no-windows/--no-mac.")
-
         dump_yaml(manifest, args.output)
+
         parsed_manifest = validate_yaml(args.output)
         if not args.no_schema_validation:
             validate_against_official_schema(parsed_manifest, schema_url=SCHEMA_URL, timeout=args.timeout)
             print("Official Ludusavi schema validation: OK")
 
-        print_summary(games, local)
-        print(f"\nGenerated {len(manifest)} Ludusavi entries: {args.output}")
+        print_summary(
+            groups,
+            catalog,
+            local,
+            serialstation_title_ids=len(title_ids),
+            catalog_fallback_count=catalog_fallback_count,
+            include_demos=args.include_demos,
+        )
+        print(f"\nGenerated {len(manifest)} Ludusavi game entries: {args.output}")
         print("YAML validation: OK")
-        print("\nRelevant references:")
-        print(f"  Catalog:   {args.catalog_url}")
-        print(f"  Ludusavi:  {LUDUSAVI_README_URL}")
-        print(f"  Schema:    {SCHEMA_URL}")
-        print(f"  RPCS3:     {RPCS3_SAVE_SOURCE_URL}")
+        print("\nReferences:")
+        print(f"  SerialStation API: {SERIALSTATION_API_DOCS_URL}")
+        print(f"  PS3 catalog:       {args.catalog_url}")
+        print(f"  Ludusavi:          {LUDUSAVI_README_URL}")
+        print(f"  Schema:             {SCHEMA_URL}")
+        print(f"  RPCS3 save source:  {RPCS3_SAVE_SOURCE_URL}")
         return 0
 
     except requests.RequestException as exc:
-        print(f"ERROR: could not download catalog: {exc}", file=sys.stderr)
+        print(f"ERROR: network request failed: {exc}", file=sys.stderr)
         return 2
-    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+    except (OSError, UnicodeError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 3
 
